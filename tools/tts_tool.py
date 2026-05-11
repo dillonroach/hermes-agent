@@ -2,7 +2,7 @@
 """
 Text-to-Speech Tool Module
 
-Supports seven TTS providers:
+Supports eight TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
@@ -10,6 +10,8 @@ Supports seven TTS providers:
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
+- Pocket TTS (local, free): Kyutai pocket-tts HTTP server (uvx pocket-tts serve)
+  with optional voice cloning from a reference .wav
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -111,6 +113,7 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_POCKET_TTS_BASE_URL = "http://127.0.0.1:5001"
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -139,6 +142,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
+    "pocket": 5000,       # kyutai pocket-tts HTTP server (local)
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -912,11 +916,147 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# Provider: Pocket TTS (Kyutai pocket-tts HTTP server, local)
+# ===========================================================================
+def _check_pocket_tts_reachable(base_url: str, timeout: float = 1.5) -> bool:
+    """Best-effort liveness check for the pocket-tts server."""
+    import requests
+    try:
+        r = requests.get(f"{base_url.rstrip('/')}/health", timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _generate_pocket_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using a local Kyutai pocket-tts HTTP server.
+
+    Run the server with ``uvx pocket-tts serve --port 5001``. The server
+    returns 24kHz mono 16-bit PCM WAV at ``POST /tts``.
+
+    Config (``tts.pocket``):
+        base_url:  default ``http://127.0.0.1:5001``
+        voice_url: built-in voice name (e.g. "alba"), or http(s)://, or hf://
+                   reference. Mutually exclusive with ``voice_wav``.
+        voice_wav: filesystem path to a reference .wav for voice cloning.
+                   Wins over ``voice_url`` when both are set.
+    """
+    import requests
+
+    pk_config = tts_config.get("pocket", {}) or {}
+    base_url = str(
+        pk_config.get("base_url")
+        or os.getenv("POCKET_TTS_BASE_URL")
+        or DEFAULT_POCKET_TTS_BASE_URL
+    ).strip().rstrip("/")
+    voice_url = pk_config.get("voice_url") or None
+    voice_wav = pk_config.get("voice_wav") or None
+
+    # WAV path for the raw response — convert to mp3/ogg afterward if needed.
+    wav_path = output_path
+    if not output_path.endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+
+    data: Dict[str, Any] = {"text": text}
+    files = None
+    wav_handle = None
+    try:
+        if voice_wav:
+            wav_src = Path(str(voice_wav)).expanduser()
+            if not wav_src.is_file():
+                raise FileNotFoundError(f"pocket-tts voice_wav not found: {wav_src}")
+            wav_handle = open(wav_src, "rb")
+            files = {"voice_wav": (wav_src.name, wav_handle, "audio/wav")}
+        elif voice_url:
+            data["voice_url"] = str(voice_url)
+
+        try:
+            response = requests.post(
+                f"{base_url}/tts",
+                data=data,
+                files=files,
+                timeout=120,
+            )
+        except requests.ConnectionError as e:
+            raise RuntimeError(
+                f"Pocket TTS server unreachable at {base_url} "
+                f"(start it with: uvx pocket-tts serve --port "
+                f"{base_url.rsplit(':', 1)[-1] or '5001'}): {e}"
+            ) from e
+
+        if response.status_code != 200:
+            detail = response.text[:300]
+            raise RuntimeError(
+                f"Pocket TTS HTTP {response.status_code}: {detail}"
+            )
+        if not response.content:
+            raise RuntimeError("Pocket TTS returned empty response body")
+
+        with open(wav_path, "wb") as f:
+            f.write(response.content)
+    finally:
+        if wav_handle is not None:
+            try:
+                wav_handle.close()
+            except Exception:
+                pass
+
+    # Convert to caller's requested format if it wasn't .wav.
+    if wav_path != output_path:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            subprocess.run(conv_cmd, check=True, timeout=30)
+            os.remove(wav_path)
+        else:
+            os.rename(wav_path, output_path)
+
+    return output_path
+
+
+# ===========================================================================
+# Local audio playback (CLI / desktop sessions)
+# ===========================================================================
+def _spawn_playback(file_path: str) -> None:
+    """Play *file_path* in a daemon thread so the tool returns immediately."""
+    def _runner():
+        try:
+            from tools.voice_mode import play_audio_file
+            play_audio_file(file_path)
+        except Exception as exc:
+            logger.debug("TTS auto-play failed for %s: %s", file_path, exc)
+    threading.Thread(target=_runner, name="tts-autoplay", daemon=True).start()
+
+
+def _should_autoplay(
+    auto_play: Optional[bool],
+    tts_config: Dict[str, Any],
+    platform: str,
+) -> bool:
+    """Decide whether to play TTS audio locally after generation.
+
+    - Explicit kwarg wins.
+    - Then ``tts.auto_play`` from config (bool).
+    - Default: play in CLI / no-platform sessions; skip on messaging platforms
+      whose gateway delivers the MEDIA: tag as a native voice message.
+    """
+    if auto_play is not None:
+        return bool(auto_play)
+    cfg_val = tts_config.get("auto_play")
+    if isinstance(cfg_val, bool):
+        return cfg_val
+    # Messaging platforms handle delivery themselves via the MEDIA: tag.
+    messaging_platforms = {"telegram", "discord", "whatsapp", "matrix", "slack"}
+    return platform not in messaging_platforms
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
+    auto_play: Optional[bool] = None,
 ) -> str:
     """
     Convert text to speech audio.
@@ -925,12 +1065,15 @@ def text_to_speech_tool(
     The model sends text; the user configures voice and provider.
 
     On messaging platforms, the returned MEDIA:<path> tag is intercepted
-    by the send pipeline and delivered as a native voice message.
-    In CLI mode, the file is saved to ~/voice-memos/.
+    by the send pipeline and delivered as a native voice message. In CLI /
+    desktop sessions the audio is also played to the default output device
+    (suppress with ``auto_play=False`` or ``tts.auto_play: false`` in config).
 
     Args:
         text: The text to convert to speech.
         output_path: Optional custom save path. Defaults to ~/voice-memos/<timestamp>.mp3
+        auto_play: Tri-state override for local playback. ``None`` (default) =
+            play in CLI / desktop sessions, skip on messaging platforms.
 
     Returns:
         str: JSON result with success, file_path, and optionally MEDIA tag.
@@ -1048,6 +1191,10 @@ def text_to_speech_tool(
             logger.info("Generating speech with KittenTTS (local, ~25MB)...")
             _generate_kittentts(text, file_str, tts_config)
 
+        elif provider == "pocket":
+            logger.info("Generating speech with Pocket TTS (local Kyutai server)...")
+            _generate_pocket_tts(text, file_str, tts_config)
+
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
             edge_available = True
@@ -1087,7 +1234,7 @@ def text_to_speech_tool(
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV — all need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai", "kittentts") and not file_str.endswith(".ogg"):
+        if provider in ("edge", "neutts", "minimax", "xai", "kittentts", "pocket") and not file_str.endswith(".ogg"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
@@ -1097,6 +1244,13 @@ def text_to_speech_tool(
 
         file_size = os.path.getsize(file_str)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
+
+        # Play locally in CLI / desktop sessions. Messaging platforms skip
+        # this — their gateway delivers the MEDIA: tag as a native voice msg.
+        played = False
+        if _should_autoplay(auto_play, tts_config, platform):
+            _spawn_playback(file_str)
+            played = True
 
         # Build response with MEDIA tag for platform delivery
         media_tag = f"MEDIA:{file_str}"
@@ -1109,6 +1263,7 @@ def text_to_speech_tool(
             "media_tag": media_tag,
             "provider": provider,
             "voice_compatible": voice_compatible,
+            "played": played,
         }, ensure_ascii=False)
 
     except ValueError as e:
@@ -1173,6 +1328,15 @@ def check_tts_requirements() -> bool:
     if _check_neutts_available():
         return True
     if _check_kittentts_available():
+        return True
+    # Pocket TTS counts as available if the server responds.
+    pk_cfg = (_load_tts_config() or {}).get("pocket") or {}
+    pk_url = str(
+        pk_cfg.get("base_url")
+        or os.getenv("POCKET_TTS_BASE_URL")
+        or DEFAULT_POCKET_TTS_BASE_URL
+    ).strip().rstrip("/")
+    if _check_pocket_tts_reachable(pk_url):
         return True
     return False
 
@@ -1486,7 +1650,7 @@ from tools.registry import registry, tool_error
 
 TTS_SCHEMA = {
     "name": "text_to_speech",
-    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as a voice message. On Telegram it plays as a voice bubble, on Discord/WhatsApp as an audio attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider are user-configured, not model-selected.",
+    "description": "Convert text to speech audio and play it back to the user. In CLI/desktop sessions the audio plays through the default output device automatically (the user listens while doing other work). On messaging platforms (Telegram/Discord/WhatsApp) the returned MEDIA: path is delivered as a voice message. CALL THIS as a parallel status channel: after completing a meaningful action (file written, command run, search returned, error hit), also call text_to_speech with a 1–2 sentence spoken summary of what just happened or what you're about to do next. Keep it conversational, no markdown/URLs/code (those read badly aloud). Don't TTS trivial replies or mid-chain reasoning. Voice and provider are user-configured, not model-selected.",
     "parameters": {
         "type": "object",
         "properties": {

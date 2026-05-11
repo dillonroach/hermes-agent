@@ -361,12 +361,20 @@ PLATFORM_HINTS = {
     "cli": (
         "You are a CLI AI Agent. Try not to use markdown but simple text "
         "renderable inside a terminal. "
-        "File delivery: there is no attachment channel — the user reads your "
-        "response directly in their terminal. Do NOT emit MEDIA:/path tags "
-        "(those are only intercepted on messaging platforms like Telegram, "
-        "Discord, Slack, etc.; on the CLI they render as literal text). "
+        "File delivery: there is no visual attachment channel — the user reads "
+        "your response directly in their terminal. Do NOT paste MEDIA:/path "
+        "tags into your visible text reply (on the CLI they render as literal "
+        "text rather than being intercepted as on Telegram/Discord/Slack). "
         "When referring to a file you created or changed, just state its "
-        "absolute path in plain text; the user can open it from there."
+        "absolute path in plain text; the user can open it from there. "
+        "Audio IS a real output channel on the CLI: the text_to_speech tool "
+        "auto-plays its output through the user's speakers as soon as the tool "
+        "returns. Use text_to_speech freely for spoken status updates and "
+        "narration alongside your text reply — calling the tool is correct and "
+        "encouraged; you just shouldn't echo the MEDIA: tag from its result "
+        "into your visible text response. The MEDIA: tag living inside the "
+        "tool result JSON is fine — it's not part of what the user reads on "
+        "screen."
     ),
     "sms": (
         "You are communicating via SMS. Keep responses concise and use plain text "
@@ -474,16 +482,154 @@ WSL_ENVIRONMENT_HINT = (
     "the Windows username if needed."
 )
 
+MICROSANDBOX_ENVIRONMENT_HINT_BASE = (
+    "Your terminal, code execution, and file tools all run inside a "
+    "microsandbox microVM — a real, isolated Linux VM (not a chroot, not the "
+    "host). From your perspective the only filesystem you can read or write "
+    "is the VM's filesystem. Your working directory is `/workspace` and that "
+    "is the canonical path you should reference for project files. "
+    "The host machine has a different layout that is NOT visible to your "
+    "VM-side tools — paths like `/home/<user>/...`, `/Users/<user>/...`, or "
+    "anything under the project root on the host (e.g. "
+    "`/home/<user>/<project>/hermes/workspace`) do NOT exist inside the VM. "
+    "If a tool result, a "
+    "stale context message, the user, or your own memory ever references "
+    "such a host path, treat it as informational only and translate to "
+    "`/workspace` (or its subpaths) before issuing any VM-side tool call. "
+    "Do NOT try to reach host paths through `terminal`, `read_file`, "
+    "`write_file`, or `execute_code` — those run inside the VM and the host "
+    "filesystem isn't there."
+)
+
+
+def _read_broker_host_fs_policy() -> Optional[dict]:
+    """Best-effort read of the broker's host_fs allow-list / deny-globs.
+
+    Locates the broker config via `HERMES_MSB_BROKER_TOKEN_FILE` (set by
+    `scripts/launch.sh`): the token sits at `<project>/broker/run/token`,
+    so `<project>/broker/config.yaml` lives two levels up. Returns a dict
+    with `allow` (resolved absolute paths) and `deny_globs`, or None when
+    the broker config can't be located or parsed.
+    """
+    token_file = os.environ.get("HERMES_MSB_BROKER_TOKEN_FILE")
+    if not token_file:
+        return None
+    try:
+        broker_root = Path(token_file).resolve().parent.parent
+        cfg_path = broker_root / "config.yaml"
+        if not cfg_path.is_file():
+            return None
+        import yaml as _yaml
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = _yaml.safe_load(f) or {}
+        host_fs = cfg.get("host_fs", {}) or {}
+        allow_raw = host_fs.get("allow", []) or []
+        deny_globs = host_fs.get("deny_globs", []) or []
+        allow_resolved: list[str] = []
+        for entry in allow_raw:
+            if not isinstance(entry, str):
+                continue
+            try:
+                p = Path(os.path.expanduser(entry))
+                allow_resolved.append(str(p))
+            except Exception:
+                allow_resolved.append(entry)
+        return {
+            "allow_raw": [str(e) for e in allow_raw if isinstance(e, str)],
+            "allow_resolved": allow_resolved,
+            "deny_globs": [str(g) for g in deny_globs if isinstance(g, str)],
+        }
+    except Exception as e:
+        logger.debug("Could not read broker host_fs policy: %s", e)
+        return None
+
+
+def _format_host_fs_hint() -> str:
+    """Render the broker's host-fs allow-list as a hint paragraph.
+
+    Returns an empty string when the broker config isn't readable — the base
+    hint already explains the broker tools exist; this just surfaces the
+    actual paths so the agent doesn't blindly probe random host directories.
+    """
+    policy = _read_broker_host_fs_policy()
+    if not policy:
+        return (
+            "Limited read-only host access is available through "
+            "`host_fs_read` / `host_fs_list` / `host_fs_stat`, which apply a "
+            "configured allow-list and deny-glob set on the broker side. "
+            "Always start with `host_fs_list` on a known allow-listed root "
+            "to discover layout — do NOT guess paths like /home/<user>/X or "
+            "/Users/<user>/Y; anything outside the allow-list returns 403."
+        )
+
+    allow_raw = policy["allow_raw"]
+    allow_resolved = policy["allow_resolved"]
+    deny_globs = policy["deny_globs"]
+
+    if not allow_raw:
+        allow_block = (
+            "The broker host_fs allow-list is currently empty — "
+            "`host_fs_*` calls will refuse every path. If the user expects "
+            "host access, ask them to add a path to broker/config.yaml."
+        )
+    else:
+        pairs: list[str] = []
+        for raw, resolved in zip(allow_raw, allow_resolved):
+            if raw == resolved:
+                pairs.append(f"`{raw}`")
+            else:
+                pairs.append(f"`{raw}` (= `{resolved}`)")
+        allow_block = (
+            "Read-only host access through `host_fs_read` / `host_fs_list` / "
+            "`host_fs_stat` is allow-listed to: "
+            + ", ".join(pairs)
+            + ". Anything outside that list returns 403 — do NOT guess "
+            "paths in `/home/<user>/X`, `/Users/<user>/Y`, or elsewhere on "
+            "the host. When you need to find a file the user mentioned, "
+            "start with `host_fs_list` on the closest allow-listed root and "
+            "navigate from there."
+        )
+
+    if deny_globs:
+        # Only mention the categories, not the raw glob list — keeps the
+        # hint short and the user's exact patterns out of the prompt.
+        deny_block = (
+            " The broker also fails-closed on common secret patterns "
+            "(e.g. .env, .ssh, .aws, .gnupg, .config, *.pem, *.key, "
+            "credentials*) regardless of allow-list."
+        )
+    else:
+        deny_block = ""
+
+    return allow_block + deny_block
+
+
+def _build_microsandbox_hint() -> str:
+    """Assemble the microsandbox environment hint with live broker policy."""
+    parts = [MICROSANDBOX_ENVIRONMENT_HINT_BASE, _format_host_fs_hint()]
+    web_block = (
+        "Outbound HTTP runs through `web_fetch` (broker-mediated, "
+        "audit-logged, SSRF-blocked, deny-globbed). Search the web through "
+        "`web_search`. Do not try direct curl/requests/httpx from inside "
+        "the VM — the network policy denies anything but the broker."
+    )
+    parts.append(web_block)
+    return " ".join(p.strip() for p in parts if p.strip())
+
 
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
 
-    Detects WSL, and can be extended for Termux, Docker, etc.
+    Detects WSL and microsandbox, and can be extended for Termux, Docker, etc.
     Returns an empty string when no special environment is detected.
     """
     hints: list[str] = []
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)
+    # microsandbox VM: the agent's tool surface lives at /workspace inside a
+    # libkrun microVM; host paths are not reachable through terminal/file tools.
+    if (os.environ.get("TERMINAL_ENV") or "").strip().lower() == "microsandbox":
+        hints.append(_build_microsandbox_hint())
     return "\n\n".join(hints)
 
 

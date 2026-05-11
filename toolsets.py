@@ -35,6 +35,12 @@ _HERMES_CORE_TOOLS = [
     "terminal", "process",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
+    # Host-FS access via the hermes-msb broker (auto-gated on broker availability)
+    "host_fs_read", "host_fs_list", "host_fs_stat",
+    # Outbound HTTP via the hermes-msb broker (auto-gated on broker availability)
+    "web_fetch",
+    # Email read/send via the hermes-msb broker (auto-gated on EMAIL_* env vars)
+    "email_list", "email_read", "email_send",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # Skills
@@ -68,8 +74,8 @@ _HERMES_CORE_TOOLS = [
 TOOLSETS = {
     # Basic toolsets - individual tool categories
     "web": {
-        "description": "Web research and content extraction tools",
-        "tools": ["web_search", "web_extract"],
+        "description": "Web research and content extraction tools (web_fetch goes through the hermes-msb broker when active)",
+        "tools": ["web_search", "web_extract", "web_fetch"],
         "includes": []  # No other toolsets included
     },
     
@@ -148,6 +154,18 @@ TOOLSETS = {
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
         "tools": ["read_file", "write_file", "patch", "search_files"],
+        "includes": []
+    },
+
+    "host_fs": {
+        "description": "Host-filesystem access via the hermes-msb broker (microsandbox backend). Auto-gated on broker availability.",
+        "tools": ["host_fs_read", "host_fs_list", "host_fs_stat"],
+        "includes": []
+    },
+
+    "email": {
+        "description": "Email read/send via the hermes-msb broker. Auto-gated on EMAIL_* creds in HERMES_HOME/.env.",
+        "tools": ["email_list", "email_read", "email_send"],
         "includes": []
     },
     

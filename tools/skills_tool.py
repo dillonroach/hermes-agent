@@ -100,7 +100,7 @@ _PLATFORM_MAP = {
 }
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub"))
-_REMOTE_ENV_BACKENDS = frozenset({"docker", "singularity", "modal", "ssh", "daytona"})
+_REMOTE_ENV_BACKENDS = frozenset({"docker", "singularity", "modal", "ssh", "daytona", "microsandbox"})
 _secret_capture_callback = None
 
 
@@ -1327,6 +1327,29 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        # Translate skill_dir for remote backends. The host path
+        # (/home/.../hermes/config/skills/...) isn't reachable from inside the
+        # sandbox; the agent needs the IN-SANDBOX path (/root/.hermes/skills/...
+        # for docker / microsandbox; equivalent for others). Using the same
+        # mount table the backends consume so paths line up.
+        in_env_skill_dir: Optional[str] = str(skill_dir) if skill_dir else None
+        if skill_dir and backend in _REMOTE_ENV_BACKENDS:
+            try:
+                from tools.credential_files import get_skills_directory_mount
+                from pathlib import Path as _P
+                resolved = _P(skill_dir).resolve()
+                for mount in get_skills_directory_mount():
+                    host_root = _P(mount["host_path"]).resolve()
+                    container_root = mount["container_path"].rstrip("/")
+                    try:
+                        rel = resolved.relative_to(host_root)
+                        in_env_skill_dir = f"{container_root}/{rel}".rstrip("/")
+                        break
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+
         result = {
             "success": True,
             "name": skill_name,
@@ -1335,7 +1358,7 @@ def skill_view(
             "related_skills": related_skills,
             "content": rendered_content,
             "path": rel_path,
-            "skill_dir": str(skill_dir) if skill_dir else None,
+            "skill_dir": in_env_skill_dir,
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files

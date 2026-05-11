@@ -41,6 +41,7 @@ import threading
 import atexit
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -936,6 +937,17 @@ def _get_env_config() -> Dict[str, Any]:
         ):
             host_cwd = candidate
             cwd = "/workspace"
+    elif env_type == "microsandbox":
+        # microsandbox's whole value prop is a workspace bind, so always treat
+        # TERMINAL_CWD as a host path to mount at /workspace (no opt-in flag).
+        ms_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        candidate = os.path.abspath(os.path.expanduser(ms_cwd_source))
+        if (
+            any(candidate.startswith(p) for p in host_prefixes)
+            or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
+        ):
+            host_cwd = candidate
+            cwd = "/workspace"
     elif env_type in ("modal", "docker", "singularity", "daytona") and cwd:
         # Host paths and relative paths that won't work inside containers
         is_host_path = any(cwd.startswith(p) for p in host_prefixes)
@@ -954,6 +966,10 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "microsandbox_image": os.getenv("TERMINAL_MICROSANDBOX_IMAGE", default_image),
+        "microsandbox_network": _parse_env_var(
+            "TERMINAL_MICROSANDBOX_NETWORK", "{}", json.loads, "valid JSON"
+        ),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1103,6 +1119,31 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
+    elif env_type == "microsandbox":
+        # Lazy import so the microsandbox SDK is only required when this
+        # backend is selected. Network is optional config — defaults to the
+        # SDK's public_only policy when not specified.
+        from tools.environments.microsandbox import (
+            MicrosandboxEnvironment as _MicrosandboxEnvironment,
+        )
+        # microsandbox's whole value prop is the /workspace bind — always on
+        # by default. The legacy `docker_mount_cwd_to_workspace` flag is a
+        # docker-specific opt-in (default false) that doesn't apply here. If
+        # we ever need a microsandbox-specific opt-out, add a new config key.
+        return _MicrosandboxEnvironment(
+            image=image,
+            cwd=cwd,
+            timeout=timeout,
+            cpus=max(1, int(cpu)) if cpu else 2,
+            memory_mib=max(256, int(memory)) if memory else 4096,
+            task_id=task_id,
+            volumes=volumes,
+            host_cwd=host_cwd,
+            auto_mount_cwd=True,
+            env=docker_env,
+            network=cc.get("microsandbox_network"),
+        )
+
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -1116,7 +1157,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         )
 
     else:
-        raise ValueError(f"Unknown environment type: {env_type}. Use 'local', 'docker', 'singularity', 'modal', 'daytona', or 'ssh'")
+        raise ValueError(f"Unknown environment type: {env_type}. Use 'local', 'docker', 'singularity', 'modal', 'daytona', 'microsandbox', or 'ssh'")
 
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
@@ -1574,6 +1615,8 @@ def terminal_tool(
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
+        elif env_type == "microsandbox":
+            image = overrides.get("microsandbox_image") or config["microsandbox_image"]
         else:
             image = ""
 
@@ -2076,10 +2119,31 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
+        elif env_type == "microsandbox":
+            if importlib.util.find_spec("microsandbox") is None:
+                logger.error(
+                    "microsandbox backend selected but the SDK is not installed. "
+                    "Install it with: pip install 'hermes-agent[microsandbox]'"
+                )
+                return False
+            # KVM is required on Linux; macOS uses HVF and there's no /dev/kvm
+            # there, so only enforce the device check on Linux.
+            if sys.platform.startswith("linux"):
+                kvm = "/dev/kvm"
+                if not (os.path.exists(kvm) and os.access(kvm, os.R_OK | os.W_OK)):
+                    logger.error(
+                        "microsandbox backend requires KVM but %s is not "
+                        "readable+writable. Add your user to the 'kvm' group "
+                        "(`sudo usermod -aG kvm $USER`) and re-login.",
+                        kvm,
+                    )
+                    return False
+            return True
+
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, ssh.",
+                "modal, daytona, microsandbox, ssh.",
                 env_type,
             )
             return False

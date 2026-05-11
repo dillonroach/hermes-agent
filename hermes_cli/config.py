@@ -745,7 +745,7 @@ DEFAULT_CONFIG = {
     # limit (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k model-aware,
     # Gemini 5000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "neutts" (local)
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "neutts" (local) | "pocket" (local Kyutai server)
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -774,6 +774,15 @@ DEFAULT_CONFIG = {
             "ref_text": "",   # Path to reference voice transcript (empty = bundled default)
             "model": "neuphonic/neutts-air-q4-gguf",  # HuggingFace model repo
             "device": "cpu",  # cpu, cuda, or mps
+        },
+        "pocket": {
+            # Kyutai pocket-tts: run `uvx pocket-tts serve --port 5001`
+            "base_url": "http://127.0.0.1:5001",
+            # Built-in voice name (e.g. "alba"), or http(s)://, or hf:// reference.
+            # Mutually exclusive with voice_wav (voice_wav wins when both set).
+            "voice_url": "",
+            # Path to a .wav reference for voice cloning (e.g. pocket-tts/Alison_Balsom_clip.wav)
+            "voice_wav": "",
         },
     },
     

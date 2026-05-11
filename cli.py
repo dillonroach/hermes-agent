@@ -551,6 +551,8 @@ def load_cli_config() -> Dict[str, Any]:
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+        "microsandbox_image": "TERMINAL_MICROSANDBOX_IMAGE",
+        "microsandbox_network": "TERMINAL_MICROSANDBOX_NETWORK",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
@@ -579,7 +581,7 @@ def load_cli_config() -> Dict[str, Any]:
         if config_key in terminal_config:
             if _file_has_terminal_config or env_var not in os.environ:
                 val = terminal_config[config_key]
-                if isinstance(val, list):
+                if isinstance(val, (list, dict)):
                     os.environ[env_var] = json.dumps(val)
                 else:
                     os.environ[env_var] = str(val)
@@ -7874,7 +7876,9 @@ class HermesCLI:
                 f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
             )
 
-            text_to_speech_tool(text=tts_text, output_path=mp3_path)
+            # auto_play=False — we do our own playback below and don't want
+            # the tool's daemon-thread playback to double-fire.
+            text_to_speech_tool(text=tts_text, output_path=mp3_path, auto_play=False)
 
             # Play the MP3 directly (the TTS tool returns OGG path but MP3 still exists)
             if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
